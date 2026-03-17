@@ -1,0 +1,36 @@
+graph_node:
+  ros__parameters:
+
+    # ===== CORE =====
+    AGCONOFF: 1
+    ECHOONOFF: 1
+    STATNOISEONOFF: 1
+    NONSTATNOISEONOFF: 1
+    TRANSIENTONOFF: 1
+    RT60ONOFF: 1
+    CNIONOFF: 1
+    NLATTENONOFF: 1
+    HPFONOFF: 1
+
+    # ===== AGC =====
+    AGCMAXGAIN: 20
+    AGCDESIREDLEVEL: 0.02
+    AGCTIME: 0.5
+
+    # ===== NOISE =====
+    GAMMA_NS: 1.5
+    GAMMA_NN: 1.3
+    MIN_NS: 0.15
+    MIN_NN: 0.10
+
+    # ===== ASR =====
+    GAMMA_NS_SR: 1.4
+    GAMMA_NN_SR: 1.4
+    MIN_NS_SR: 0.20
+    MIN_NN_SR: 0.20
+
+    # ===== BEAMFORMING =====
+    GAMMA_E: 1.5
+    GAMMA_ETAIL: 1.3
+    GAMMA_ENL: 2.0
+    AECNORM: 1.0
