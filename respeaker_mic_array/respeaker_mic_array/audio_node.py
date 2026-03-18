@@ -1,382 +1,161 @@
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
-from launch.conditions import IfCondition
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
-from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
+#!/usr/bin/env python3
+import sys
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Int16MultiArray, Float32, Int16MultiArray
+
+import pyqtgraph as pg
+from PyQt5 import QtWidgets, QtCore
+
+RATE = 16000
+CHUNK = 1024
+HISTORY = RATE * 2
+FPS = 60
 
 
-def generate_launch_description():
-    # Launch args
-    ur_type = LaunchConfiguration("ur_type")
-    robot_ip = LaunchConfiguration("robot_ip")
-    use_fake_hardware = LaunchConfiguration("use_fake_hardware")
-    launch_rviz = LaunchConfiguration("launch_rviz")
-    gripper_mode = LaunchConfiguration("gripper_mode")  # sim | real
+class AudioMonitorNode(Node):
+    def __init__(self):
+        super().__init__('audio_monitor_gui')
 
-    declare_ur_type = DeclareLaunchArgument("ur_type", default_value="ur5e")
-    declare_robot_ip = DeclareLaunchArgument("robot_ip", default_value="192.168.1.200")
-    declare_use_fake_hw = DeclareLaunchArgument("use_fake_hardware", default_value="false")
-    declare_launch_rviz = DeclareLaunchArgument("launch_rviz", default_value="true")
-    declare_gripper_mode = DeclareLaunchArgument("gripper_mode", default_value="real")
-
-    # ur_robot_driver: initial controller
-    initial_joint_controller = PythonExpression([
-        "'joint_trajectory_controller' if '", use_fake_hardware, "' == 'true' "
-        "else 'scaled_joint_trajectory_controller'"
-    ])
-
-    # Custom controller / RViz files
-    controllers_file = PathJoinSubstitution([
-        FindPackageShare("ur5_custom_description"),
-        "config",
-        "ur5e_with_gripper_controllers.yaml",
-    ])
-
-    rviz_config = PathJoinSubstitution([
-        FindPackageShare("ur5_sim_gz"),
-        "rviz",
-        "ur5_with_gripper.rviz",
-    ])
-
-    # UR config files
-    ur5e_cfg_dir = PathJoinSubstitution([
-        FindPackageShare("ur5_custom_description"),
-        "config",
-        "ur5e",
-    ])
-
-    joint_limit_params = PathJoinSubstitution([ur5e_cfg_dir, "joint_limits.yaml"])
-    physical_params = PathJoinSubstitution([ur5e_cfg_dir, "physical_parameters.yaml"])
-    visual_params = PathJoinSubstitution([ur5e_cfg_dir, "visual_parameters.yaml"])
-
-    default_kinematics_params = PathJoinSubstitution([ur5e_cfg_dir, "default_kinematics.yaml"])
-    calibration_params = PathJoinSubstitution([ur5e_cfg_dir, "calibration.yaml"])
-
-    # fake -> default_kinematics, real -> calibration
-    kinematics_params = PythonExpression([
-        "('", default_kinematics_params, "') if ('", use_fake_hardware, "' == 'true') "
-        "else ('", calibration_params, "')"
-    ])
-
-    # UR driver
-    ur_driver = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([
-                FindPackageShare("ur_robot_driver"),
-                "launch",
-                "ur_control.launch.py",
-            ])
-        ),
-        launch_arguments={
-            "ur_type": ur_type,
-            "robot_ip": robot_ip,
-            "use_fake_hardware": use_fake_hardware,
-            "launch_rviz": launch_rviz,
-            "initial_joint_controller": initial_joint_controller,
-
-            "description_package": "ur5_custom_description",
-            "description_file": "ur5e_with_gripper.urdf.xacro",
-
-            "controllers_file": controllers_file,
-            "rviz_config": rviz_config,
-
-            "joint_limit_params": joint_limit_params,
-            "kinematics_params": kinematics_params,
-            "physical_params": physical_params,
-            "visual_params": visual_params,
-        }.items(),
-    )
-
-    # ReSpeaker mic array launch
-    # IMPORTANT:
-    respeaker_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([
-                FindPackageShare("respeaker_mic_array"),
-                "launch",
-                "respeaker.launch.py",
-            ])
+        self.create_subscription(
+            Int16MultiArray,
+            '/voice/audio_monitor',
+            self.audio_callback,
+            10
         )
+
+        self.create_subscription(
+            Float32,
+            '/voice/noise_rms',
+            self.rms_callback,
+            10
+        )
+
+        self.ring = np.zeros(HISTORY, dtype=np.int16)
+        self.ptr = 0
+
+        self.latest = np.zeros(CHUNK, dtype=np.int16)
+        self.rms = 0.0
+
+    # -------------------------------------------------
+
+    def audio_callback(self, msg):
+        data = np.array(msg.data, dtype=np.int16)
+
+        if len(data) < 10:
+            return
+
+        self.latest = data.copy()
+        n = len(data)
+
+        if n >= HISTORY:
+            self.ring[:] = data[-HISTORY:]
+            self.ptr = 0
+            return
+
+        end = self.ptr + n
+
+        if end < HISTORY:
+            self.ring[self.ptr:end] = data
+        else:
+            part = HISTORY - self.ptr
+            self.ring[self.ptr:] = data[:part]
+            self.ring[:n - part] = data[part:]
+
+        self.ptr = (self.ptr + n) % HISTORY
+
+    def rms_callback(self, msg):
+        self.rms = msg.data
+
+class AudioWindow(QtWidgets.QMainWindow):
+    def __init__(self, node):
+        super().__init__()
+        self.node = node
+
+        self.setWindowTitle("REALTIME STT Audio Monitor")
+        self.resize(1300, 760)
+
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
+
+        pg.setConfigOptions(antialias=True)
+
+        # ===== WAVE =====
+        self.pw = pg.PlotWidget(title="Realtime Waveform")
+        self.pw.setYRange(-20000, 20000)
+        self.pw.showGrid(x=True, y=True)
+        self.curve_wave = self.pw.plot(pen=pg.mkPen('y', width=1))
+
+        # ===== FFT =====
+        self.pf = pg.PlotWidget(title="FFT Spectrum")
+        self.pf.setXRange(0, 8000)
+        self.pf.setYRange(0, 110)
+        self.pf.showGrid(x=True, y=True)
+        self.curve_fft = self.pf.plot(pen=pg.mkPen('c', width=1))
+
+        # ===== INFO =====
+        self.label = QtWidgets.QLabel("RMS: 0")
+        self.label.setStyleSheet("font-size:16px; color: lime")
+
+        self.indicator = QtWidgets.QLabel("● AUDIO")
+        self.indicator.setStyleSheet("font-size:18px; color: gray")
+
+        layout.addWidget(self.pw)
+        layout.addWidget(self.pf)
+        layout.addWidget(self.label)
+        layout.addWidget(self.indicator)
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(int(1000 / FPS))
+
+    # -------------------------------------------------
+
+    def update_plot(self):
+        ptr = self.node.ptr
+        ring = self.node.ring
+
+        view = np.roll(ring, -ptr)
+        self.curve_wave.setData(view)
+
+        # FFT
+        s = view[::4]
+        fft = np.abs(np.fft.rfft(s))
+        fft[fft == 0] = 1e-12
+
+        fft_db = 20 * np.log10(fft)
+        freq = np.fft.rfftfreq(len(s), 1.0 / RATE)
+
+        self.curve_fft.setData(freq, fft_db)
+
+        self.label.setText(f"RMS: {int(self.node.rms)}")
+
+        # indicator
+        if self.node.rms > 80:
+            self.indicator.setStyleSheet("font-size:18px; color: lime")
+        else:
+            self.indicator.setStyleSheet("font-size:18px; color: gray")
+
+def main():
+    rclpy.init()
+
+    node = AudioMonitorNode()
+
+    app = QtWidgets.QApplication(sys.argv)
+    win = AudioWindow(node)
+    win.show()
+
+    ros_timer = QtCore.QTimer()
+    ros_timer.timeout.connect(
+        lambda: rclpy.spin_once(node, timeout_sec=0)
     )
+    ros_timer.start(5)
 
-    # MoveIt
-    moveit_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([
-                FindPackageShare("ur_moveit_config"),
-                "launch",
-                "ur_moveit.launch.py",
-            ])
-        ),
-        launch_arguments={
-            "ur_type": ur_type,
-            "use_fake_hardware": use_fake_hardware,
-            "launch_rviz": "false",  
-        }.items(),
-    )
+    sys.exit(app.exec_())
 
-    # Spawn only gripper controller (SIM only) 
-    gripper_spawner = Node(
-        package="controller_manager",
-        executable="spawner",
-        arguments=["gripper_controller", "--controller-manager", "/controller_manager"],
-        output="screen",
-        condition=IfCondition(PythonExpression(["'", gripper_mode, "' == 'sim'"])),
-    )
-    auto_spawn_gripper = TimerAction(period=6.0, actions=[gripper_spawner])
 
-    # Voice stack nodes
-    beep = Node(
-        package="ur5_sim_gz",
-        executable="beep_node",
-        name="beep_node",
-        output="screen",
-    )
-
-    tts = Node(
-        package="ur5_sim_gz",
-        executable="tts_node_gtts",
-        name="tts_node_gtts",
-        output="screen",
-    )
-
-    stt = Node(
-        package="ur5_sim_gz",
-        executable="speech_to_text_node",
-        name="speech_to_text_node",
-        output="screen",
-        parameters=[{
-            "debug_print_heard": False,
-            "idle_recognize_interval_sec": 0.6,
-            "post_tts_ignore_sec": 0.8,
-            "tts_resume_delay_sec": 0.8,
-        }],
-    )
-
-    fsm = Node(
-        package="ur5_sim_gz",
-        executable="dialog_fsm_node",
-        name="dialog_fsm_node",
-        output="screen",
-        parameters=[{
-            "wake_words": ["สวัสดี", "Hello"],
-            "wake_timeout_sec": 6.0,
-            "wake_cooldown_ms": 1200,
-            "post_command_ignore_sec": 1.0,
-            "tts_resume_delay_sec": 1.0,
-            "dialog_max_retry": 2,
-            "debug_heard_when_active": True,
-            "beep_enabled": True,
-        }],
-    )
-
-    gui = Node(
-        package="ur5_sim_gz",
-        executable="speech_gui_node",
-        name="speech_gui_node",
-        output="screen",
-    )
-
-    nlu = Node(
-        package="ur5_sim_gz",
-        executable="nlu_parser_node",
-        name="nlu_parser_node",
-        output="screen",
-    )
-
-    logger = Node(
-        package="ur5_sim_gz",
-        executable="voice_logger_node",
-        name="voice_logger_node",
-        output="screen",
-    )
-
-    # Gripper bridge (sim/real)
-    # NOTE:
-    gripper_bridge = Node(
-        package="ur5_sim_gz",
-        executable="gripper_bridge_node",
-        name="gripper_bridge_node",
-        output="screen",
-        parameters=[{
-            "mode": gripper_mode,
-            "cmd_topic": "/Neural_parser/cmd_group",
-
-            "sim_publish_also_in_real": False,   # แนะนำ False
-            "sim_topic": "/gripper_controller/commands",
-            "sim_open": 0.0,
-            "sim_close": 0.01,
-
-            "io_service": "/io_and_status_controller/set_io",
-            "fun": 1,
-
-            # REAL: DO16/DO17
-            "use_two_pins": True,
-            "open_pin": 16,
-            "close_pin": 17,
-            "pulse_ms": 200,
-
-            # fallback (ไม่ใช้ใน two-pin)
-            "do_pin": 0,
-            "open_state": 0.0,
-            "close_state": 1.0,
-        }],
-    )
-
-    # Robot command nodes
-    mapper_sim = Node(
-        package="ur5_sim_gz",
-        executable="ur5_cmd_mapper_node",
-        name="ur5_cmd_mapper_node",
-        output="screen",
-        parameters=[{
-            "mode": "high_level",
-            "debug": True,
-            "traj_topic": "/joint_trajectory_controller/joint_trajectory",
-            "step_xyz_m": 0.03,
-            "rotate_step_deg": 15.0,
-            "traj_time_s": 1.0,
-            "max_deg": 180.0,
-            "max_step_m": 0.20,
-        }],
-        condition=IfCondition(use_fake_hardware),
-    )
-
-    executor_sim = Node(
-        package="ur5_sim_gz",
-        executable="ur5_executor_node",
-        name="ur5_executor_node",
-        output="screen",
-        remappings=[
-            ("/ur5/command_trajectory", "/joint_trajectory_controller/joint_trajectory"),
-        ],
-        condition=IfCondition(use_fake_hardware),
-    )
-
-    mapper_real = Node(
-        package="ur5_sim_gz",
-        executable="ur5_cmd_mapper_node",
-        name="ur5_cmd_mapper_node_real",
-        output="screen",
-        parameters=[{
-            "mode": "high_level",
-            "debug": True,
-            "traj_topic": "/scaled_joint_trajectory_controller/joint_trajectory",
-            "step_xyz_m": 0.03,
-            "rotate_step_deg": 15.0,
-            "traj_time_s": 1.0,
-            "max_deg": 180.0,
-            "max_step_m": 0.20,
-        }],
-        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
-    )
-
-    executor_real = Node(
-        package="ur5_sim_gz",
-        executable="ur5_executor_node",
-        name="ur5_executor_node_real",
-        output="screen",
-        remappings=[
-            ("/ur5/command_trajectory", "/scaled_joint_trajectory_controller/joint_trajectory"),
-        ],
-        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
-    )
-
-    # Control Position Node
-    control_position_node = Node(
-        package="ur5_sim_gz",
-        executable="control_position_node",
-        name="control_position_node",
-        output="screen",
-    )
-
-    delayed_control_position = TimerAction(
-        period=7.0,
-        actions=[control_position_node],
-    )
-
-    # Logical pick object (SIM only)
-    logical_pick_object_node = Node(
-        package="ur5_workcell_scene",
-        executable="logical_pick_object_node",
-        name="logical_pick_object_node",
-        output="screen",
-        parameters=[{
-            "world_frame": "world",
-            "gripper_frame": "tool0",
-        }],
-        condition=IfCondition(use_fake_hardware),
-    )
-
-    delayed_logical_pick_object = TimerAction(
-        period=7.5,
-        actions=[logical_pick_object_node],
-    )
-
-    # Start robot command nodes after driver + MoveIt
-    delayed_robot_nodes = TimerAction(
-        period=8.0,
-        actions=[
-            mapper_sim,
-            executor_sim,
-            mapper_real,
-            executor_real,
-        ],
-    )
-
-    # Force monitor nodes (SIM / REAL)
-    force_monitor_sim = Node(
-        package="ur5_force_tools",
-        executable="force_gui",
-        name="ur5_force_gui_sim",
-        output="screen",
-        condition=IfCondition(use_fake_hardware),
-    )
-
-    force_monitor_real = Node(
-        package="ur5_force_tools",
-        executable="force_gui",
-        name="ur5_force_gui_real",
-        output="screen",
-        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
-    )
-
-    # Final LaunchDescription
-    return LaunchDescription([
-        declare_ur_type,
-        declare_robot_ip,
-        declare_use_fake_hw,
-        declare_launch_rviz,
-        declare_gripper_mode,
-
-        # core robot
-        ur_driver,
-        moveit_launch,
-
-        # sim gripper controller
-        auto_spawn_gripper,
-
-        # audio stack (from respeaker_mic_array package)
-        respeaker_launch,
-
-        # voice stack
-        stt,
-        beep,
-        tts,
-        fsm,
-        gui,
-        nlu,
-        logger,
-        gripper_bridge,
-
-        # force monitor
-        force_monitor_sim,
-        force_monitor_real,
-
-        # delayed robot helpers
-        delayed_control_position,
-        delayed_logical_pick_object,
-        delayed_robot_nodes,
-    ])
+if __name__ == '__main__':
+    main()
