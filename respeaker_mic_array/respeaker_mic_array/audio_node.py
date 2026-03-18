@@ -1,299 +1,382 @@
-# import rclpy
-# from rclpy.node import Node
-# from std_msgs.msg import UInt8MultiArray
-# import pyaudio
-
-# RATE = 16000
-# CHANNELS = 6   # ใช้ 6 ถ้า firmware เป็น 6ch
-# WIDTH = 2
-# CHUNK = 1024
-
-# class AudioNode(Node):
-#     def __init__(self):
-#         super().__init__('respeaker_audio_node')
-
-#         self.pub = self.create_publisher(UInt8MultiArray, 'respeaker/audio_raw', 10)
-
-#         p = pyaudio.PyAudio()
-
-#         # Find ReSpeaker device index
-#         device_index = None
-#         for i in range(p.get_device_count()):
-#             name = p.get_device_info_by_index(i)['name']
-#             if 'ReSpeaker' in name or 'ArrayUAC10' in name:
-#                 device_index = i
-#                 break
-
-#         if device_index is None:
-#             self.get_logger().error("ReSpeaker device not found!")
-#             return
-
-#         self.get_logger().info(f"Using ReSpeaker input device index: {device_index}")
-
-#         self.stream = p.open(
-#             rate=RATE,
-#             channels=CHANNELS,
-#             format=p.get_format_from_width(WIDTH),
-#             input=True,
-#             input_device_index=device_index,
-#             frames_per_buffer=CHUNK
-#         )
-
-#         self.timer = self.create_timer(0.05, self.publish_audio)
-
-#     def publish_audio(self):
-#         data = self.stream.read(CHUNK, exception_on_overflow=False)
-#         msg = UInt8MultiArray()
-#         msg.data = list(data)
-#         self.pub.publish(msg)
-
-# def main():
-#     rclpy.init()
-#     node = AudioNode()
-#     rclpy.spin(node)
-#     rclpy.shutdown()
-
-#!/usr/bin/env python3
-import rclpy
-from rclpy.node import Node
-from rclpy.logging import LoggingSeverity
-from std_msgs.msg import UInt8MultiArray
-import pyaudio
-
-RATE = 16000
-CHANNELS = 6      
-WIDTH = 2
-CHUNK = 1024
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
-class AudioNode(Node):
-    def __init__(self):
-        super().__init__('respeaker_audio_node')
+def generate_launch_description():
+    # Launch args
+    ur_type = LaunchConfiguration("ur_type")
+    robot_ip = LaunchConfiguration("robot_ip")
+    use_fake_hardware = LaunchConfiguration("use_fake_hardware")
+    launch_rviz = LaunchConfiguration("launch_rviz")
+    gripper_mode = LaunchConfiguration("gripper_mode")  # sim | real
 
-        # Parameters
-        self.declare_parameter("mic_mode", "mode1")
-        # mode1 = ReSpeaker
-        # mode2 = auto scan device 
+    declare_ur_type = DeclareLaunchArgument("ur_type", default_value="ur5e")
+    declare_robot_ip = DeclareLaunchArgument("robot_ip", default_value="192.168.1.200")
+    declare_use_fake_hw = DeclareLaunchArgument("use_fake_hardware", default_value="false")
+    declare_launch_rviz = DeclareLaunchArgument("launch_rviz", default_value="true")
+    declare_gripper_mode = DeclareLaunchArgument("gripper_mode", default_value="real")
 
-        self.declare_parameter("preferred_name", "ReSpeaker")
-        self.declare_parameter("sample_rate", RATE)
-        self.declare_parameter("channels", CHANNELS)
-        self.declare_parameter("chunk_size", CHUNK)
-        self.declare_parameter("debug_log", True)
+    # ur_robot_driver: initial controller
+    initial_joint_controller = PythonExpression([
+        "'joint_trajectory_controller' if '", use_fake_hardware, "' == 'true' "
+        "else 'scaled_joint_trajectory_controller'"
+    ])
 
-        self.mic_mode = self.get_parameter("mic_mode").value
-        self.preferred_name = self.get_parameter("preferred_name").value
-        self.rate = int(self.get_parameter("sample_rate").value)
-        self.channels = int(self.get_parameter("channels").value)
-        self.chunk = int(self.get_parameter("chunk_size").value)
-        self.debug_log = bool(self.get_parameter("debug_log").value)
+    # Custom controller / RViz files
+    controllers_file = PathJoinSubstitution([
+        FindPackageShare("ur5_custom_description"),
+        "config",
+        "ur5e_with_gripper_controllers.yaml",
+    ])
 
-        if not self.debug_log:
-            self.get_logger().set_level(LoggingSeverity.WARN)
+    rviz_config = PathJoinSubstitution([
+        FindPackageShare("ur5_sim_gz"),
+        "rviz",
+        "ur5_with_gripper.rviz",
+    ])
 
-        # ROS publisher
-        self.pub = self.create_publisher(UInt8MultiArray, 'respeaker/audio_raw', 10)
+    # UR config files
+    ur5e_cfg_dir = PathJoinSubstitution([
+        FindPackageShare("ur5_custom_description"),
+        "config",
+        "ur5e",
+    ])
 
-        # PyAudio
-        self.p = pyaudio.PyAudio()
-        self.stream = None
-        self.device_index = None
+    joint_limit_params = PathJoinSubstitution([ur5e_cfg_dir, "joint_limits.yaml"])
+    physical_params = PathJoinSubstitution([ur5e_cfg_dir, "physical_parameters.yaml"])
+    visual_params = PathJoinSubstitution([ur5e_cfg_dir, "visual_parameters.yaml"])
 
-        # Select device by mode
-        if self.mic_mode == "mode1":
-            self.device_index = self.find_respeaker_device()
-        elif self.mic_mode == "mode2":
-            self.device_index = self.find_best_input_device()
-        else:
-            self.get_logger().error(
-                f"Invalid mic_mode='{self.mic_mode}'. Use 'mode1' or 'mode2'."
-            )
-            return
+    default_kinematics_params = PathJoinSubstitution([ur5e_cfg_dir, "default_kinematics.yaml"])
+    calibration_params = PathJoinSubstitution([ur5e_cfg_dir, "calibration.yaml"])
 
-        if self.device_index is None:
-            self.get_logger().error("No valid input microphone device found!")
-            return
+    # fake -> default_kinematics, real -> calibration
+    kinematics_params = PythonExpression([
+        "('", default_kinematics_params, "') if ('", use_fake_hardware, "' == 'true') "
+        "else ('", calibration_params, "')"
+    ])
 
-        # Open stream
-        try:
-            dev_info = self.p.get_device_info_by_index(self.device_index)
-            max_input_channels = int(dev_info.get("maxInputChannels", 0))
-            use_channels = min(self.channels, max_input_channels)
+    # UR driver
+    ur_driver = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("ur_robot_driver"),
+                "launch",
+                "ur_control.launch.py",
+            ])
+        ),
+        launch_arguments={
+            "ur_type": ur_type,
+            "robot_ip": robot_ip,
+            "use_fake_hardware": use_fake_hardware,
+            "launch_rviz": launch_rviz,
+            "initial_joint_controller": initial_joint_controller,
 
-            if use_channels <= 0:
-                self.get_logger().error("Selected device has no input channels.")
-                return
+            "description_package": "ur5_custom_description",
+            "description_file": "ur5e_with_gripper.urdf.xacro",
 
-            self.channels = use_channels
+            "controllers_file": controllers_file,
+            "rviz_config": rviz_config,
 
-            self.stream = self.p.open(
-                rate=self.rate,
-                channels=self.channels,
-                format=self.p.get_format_from_width(WIDTH),
-                input=True,
-                input_device_index=self.device_index,
-                frames_per_buffer=self.chunk
-            )
+            "joint_limit_params": joint_limit_params,
+            "kinematics_params": kinematics_params,
+            "physical_params": physical_params,
+            "visual_params": visual_params,
+        }.items(),
+    )
 
-            self.get_logger().info(
-                f"Audio stream opened | mode={self.mic_mode} | "
-                f"device_index={self.device_index} | "
-                f"channels={self.channels} | rate={self.rate}"
-            )
-
-        except Exception as e:
-            self.get_logger().error(f"Failed to open audio stream: {e}")
-            self.stream = None
-            return
-
-        # Timer
-        self.timer = self.create_timer(0.05, self.publish_audio)
-
-    # Device selection
-    def list_input_devices(self):
-        devices = []
-        for i in range(self.p.get_device_count()):
-            info = self.p.get_device_info_by_index(i)
-            max_in = int(info.get("maxInputChannels", 0))
-            if max_in > 0:
-                devices.append({
-                    "index": i,
-                    "name": info.get("name", ""),
-                    "max_input_channels": max_in,
-                    "default_rate": info.get("defaultSampleRate", 0),
-                })
-        return devices
-
-    def find_respeaker_device(self):
-        """
-        mode1:
-        หาเฉพาะ ReSpeaker / ArrayUAC10 / preferred_name
-        """
-        candidates = self.list_input_devices()
-
-        # priority names
-        keywords = [
-            self.preferred_name.lower(),
-            "respeaker",
-            "arrayuac10",
-        ]
-
-        for dev in candidates:
-            name_lower = dev["name"].lower()
-            for kw in keywords:
-                if kw and kw in name_lower:
-                    self.get_logger().info(
-                        f"[mode1] Selected ReSpeaker-like device: "
-                        f"index={dev['index']} name='{dev['name']}' "
-                        f"max_in={dev['max_input_channels']}"
-                    )
-                    return dev["index"]
-
-        self.get_logger().warn("[mode1] ReSpeaker device not found.")
-        return None
-
-    def find_best_input_device(self):
-        """
-        mode2:
-        สแกนทุก input device แล้วเลือกอัตโนมัติ
-        strategy:
-        1) ถ้าเจอ ReSpeaker-like -> ใช้อันนั้นก่อน
-        2) ถ้าไม่เจอ -> เลือก device ที่มี input channels มากที่สุด
-        """
-        candidates = self.list_input_devices()
-
-        if not candidates:
-            self.get_logger().warn("[mode2] No input devices found.")
-            return None
-
-        if self.debug_log:
-            self.get_logger().info("Available input devices:")
-            for dev in candidates:
-                self.get_logger().info(
-                    f"  index={dev['index']} | name='{dev['name']}' | "
-                    f"max_in={dev['max_input_channels']} | "
-                    f"default_rate={dev['default_rate']}"
-                )
-
-        for dev in candidates:
-            name_lower = dev["name"].lower()
-            if (
-                self.preferred_name.lower() in name_lower
-                or "respeaker" in name_lower
-                or "arrayuac10" in name_lower
-            ):
-                self.get_logger().info(
-                    f"[mode2] Auto-selected preferred device: "
-                    f"index={dev['index']} name='{dev['name']}'"
-                )
-                return dev["index"]
-
-        best = max(candidates, key=lambda d: d["max_input_channels"])
-
-        self.get_logger().info(
-            f"[mode2] Auto-selected best input device: "
-            f"index={best['index']} name='{best['name']}' "
-            f"max_in={best['max_input_channels']}"
+    # ReSpeaker mic array launch
+    # IMPORTANT:
+    respeaker_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("respeaker_mic_array"),
+                "launch",
+                "respeaker.launch.py",
+            ])
         )
-        return best["index"]
+    )
 
-    # Publish audio
-    def publish_audio(self):
-        if self.stream is None:
-            return
+    # MoveIt
+    moveit_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare("ur_moveit_config"),
+                "launch",
+                "ur_moveit.launch.py",
+            ])
+        ),
+        launch_arguments={
+            "ur_type": ur_type,
+            "use_fake_hardware": use_fake_hardware,
+            "launch_rviz": "false",  
+        }.items(),
+    )
 
-        try:
-            data = self.stream.read(self.chunk, exception_on_overflow=False)
-            msg = UInt8MultiArray()
-            msg.data = list(data)
-            self.pub.publish(msg)
-        except Exception as e:
-            self.get_logger().error(f"Audio read failed: {e}")
+    # Spawn only gripper controller (SIM only) 
+    gripper_spawner = Node(
+        package="controller_manager",
+        executable="spawner",
+        arguments=["gripper_controller", "--controller-manager", "/controller_manager"],
+        output="screen",
+        condition=IfCondition(PythonExpression(["'", gripper_mode, "' == 'sim'"])),
+    )
+    auto_spawn_gripper = TimerAction(period=6.0, actions=[gripper_spawner])
 
-    # Cleanup
-    def cleanup(self):
-        if self.debug_log:
-            self.get_logger().info("Cleaning up audio resources...")
+    # Voice stack nodes
+    beep = Node(
+        package="ur5_sim_gz",
+        executable="beep_node",
+        name="beep_node",
+        output="screen",
+    )
 
-        try:
-            if self.stream is not None:
-                self.stream.stop_stream()
-                self.stream.close()
-        except Exception:
-            pass
+    tts = Node(
+        package="ur5_sim_gz",
+        executable="tts_node_gtts",
+        name="tts_node_gtts",
+        output="screen",
+    )
 
-        try:
-            if self.p is not None:
-                self.p.terminate()
-        except Exception:
-            pass
+    stt = Node(
+        package="ur5_sim_gz",
+        executable="speech_to_text_node",
+        name="speech_to_text_node",
+        output="screen",
+        parameters=[{
+            "debug_print_heard": False,
+            "idle_recognize_interval_sec": 0.6,
+            "post_tts_ignore_sec": 0.8,
+            "tts_resume_delay_sec": 0.8,
+        }],
+    )
 
+    fsm = Node(
+        package="ur5_sim_gz",
+        executable="dialog_fsm_node",
+        name="dialog_fsm_node",
+        output="screen",
+        parameters=[{
+            "wake_words": ["สวัสดี", "Hello"],
+            "wake_timeout_sec": 6.0,
+            "wake_cooldown_ms": 1200,
+            "post_command_ignore_sec": 1.0,
+            "tts_resume_delay_sec": 1.0,
+            "dialog_max_retry": 2,
+            "debug_heard_when_active": True,
+            "beep_enabled": True,
+        }],
+    )
 
-def main():
-    rclpy.init()
-    node = AudioNode()
+    gui = Node(
+        package="ur5_sim_gz",
+        executable="speech_gui_node",
+        name="speech_gui_node",
+        output="screen",
+    )
 
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        print("\nCtrl+C pressed, shutting down audio node...")
-    finally:
-        try:
-            node.cleanup()
-        except Exception:
-            pass
+    nlu = Node(
+        package="ur5_sim_gz",
+        executable="nlu_parser_node",
+        name="nlu_parser_node",
+        output="screen",
+    )
 
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
+    logger = Node(
+        package="ur5_sim_gz",
+        executable="voice_logger_node",
+        name="voice_logger_node",
+        output="screen",
+    )
 
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:
-            pass
+    # Gripper bridge (sim/real)
+    # NOTE:
+    gripper_bridge = Node(
+        package="ur5_sim_gz",
+        executable="gripper_bridge_node",
+        name="gripper_bridge_node",
+        output="screen",
+        parameters=[{
+            "mode": gripper_mode,
+            "cmd_topic": "/Neural_parser/cmd_group",
 
+            "sim_publish_also_in_real": False,   # แนะนำ False
+            "sim_topic": "/gripper_controller/commands",
+            "sim_open": 0.0,
+            "sim_close": 0.01,
 
-if __name__ == '__main__':
-    main()
+            "io_service": "/io_and_status_controller/set_io",
+            "fun": 1,
+
+            # REAL: DO16/DO17
+            "use_two_pins": True,
+            "open_pin": 16,
+            "close_pin": 17,
+            "pulse_ms": 200,
+
+            # fallback (ไม่ใช้ใน two-pin)
+            "do_pin": 0,
+            "open_state": 0.0,
+            "close_state": 1.0,
+        }],
+    )
+
+    # Robot command nodes
+    mapper_sim = Node(
+        package="ur5_sim_gz",
+        executable="ur5_cmd_mapper_node",
+        name="ur5_cmd_mapper_node",
+        output="screen",
+        parameters=[{
+            "mode": "high_level",
+            "debug": True,
+            "traj_topic": "/joint_trajectory_controller/joint_trajectory",
+            "step_xyz_m": 0.03,
+            "rotate_step_deg": 15.0,
+            "traj_time_s": 1.0,
+            "max_deg": 180.0,
+            "max_step_m": 0.20,
+        }],
+        condition=IfCondition(use_fake_hardware),
+    )
+
+    executor_sim = Node(
+        package="ur5_sim_gz",
+        executable="ur5_executor_node",
+        name="ur5_executor_node",
+        output="screen",
+        remappings=[
+            ("/ur5/command_trajectory", "/joint_trajectory_controller/joint_trajectory"),
+        ],
+        condition=IfCondition(use_fake_hardware),
+    )
+
+    mapper_real = Node(
+        package="ur5_sim_gz",
+        executable="ur5_cmd_mapper_node",
+        name="ur5_cmd_mapper_node_real",
+        output="screen",
+        parameters=[{
+            "mode": "high_level",
+            "debug": True,
+            "traj_topic": "/scaled_joint_trajectory_controller/joint_trajectory",
+            "step_xyz_m": 0.03,
+            "rotate_step_deg": 15.0,
+            "traj_time_s": 1.0,
+            "max_deg": 180.0,
+            "max_step_m": 0.20,
+        }],
+        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
+    )
+
+    executor_real = Node(
+        package="ur5_sim_gz",
+        executable="ur5_executor_node",
+        name="ur5_executor_node_real",
+        output="screen",
+        remappings=[
+            ("/ur5/command_trajectory", "/scaled_joint_trajectory_controller/joint_trajectory"),
+        ],
+        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
+    )
+
+    # Control Position Node
+    control_position_node = Node(
+        package="ur5_sim_gz",
+        executable="control_position_node",
+        name="control_position_node",
+        output="screen",
+    )
+
+    delayed_control_position = TimerAction(
+        period=7.0,
+        actions=[control_position_node],
+    )
+
+    # Logical pick object (SIM only)
+    logical_pick_object_node = Node(
+        package="ur5_workcell_scene",
+        executable="logical_pick_object_node",
+        name="logical_pick_object_node",
+        output="screen",
+        parameters=[{
+            "world_frame": "world",
+            "gripper_frame": "tool0",
+        }],
+        condition=IfCondition(use_fake_hardware),
+    )
+
+    delayed_logical_pick_object = TimerAction(
+        period=7.5,
+        actions=[logical_pick_object_node],
+    )
+
+    # Start robot command nodes after driver + MoveIt
+    delayed_robot_nodes = TimerAction(
+        period=8.0,
+        actions=[
+            mapper_sim,
+            executor_sim,
+            mapper_real,
+            executor_real,
+        ],
+    )
+
+    # Force monitor nodes (SIM / REAL)
+    force_monitor_sim = Node(
+        package="ur5_force_tools",
+        executable="force_gui",
+        name="ur5_force_gui_sim",
+        output="screen",
+        condition=IfCondition(use_fake_hardware),
+    )
+
+    force_monitor_real = Node(
+        package="ur5_force_tools",
+        executable="force_gui",
+        name="ur5_force_gui_real",
+        output="screen",
+        condition=IfCondition(PythonExpression(["'", use_fake_hardware, "' == 'false'"])),
+    )
+
+    # Final LaunchDescription
+    return LaunchDescription([
+        declare_ur_type,
+        declare_robot_ip,
+        declare_use_fake_hw,
+        declare_launch_rviz,
+        declare_gripper_mode,
+
+        # core robot
+        ur_driver,
+        moveit_launch,
+
+        # sim gripper controller
+        auto_spawn_gripper,
+
+        # audio stack (from respeaker_mic_array package)
+        respeaker_launch,
+
+        # voice stack
+        stt,
+        beep,
+        tts,
+        fsm,
+        gui,
+        nlu,
+        logger,
+        gripper_bridge,
+
+        # force monitor
+        force_monitor_sim,
+        force_monitor_real,
+
+        # delayed robot helpers
+        delayed_control_position,
+        delayed_logical_pick_object,
+        delayed_robot_nodes,
+    ])
