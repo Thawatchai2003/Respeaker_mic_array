@@ -1,160 +1,213 @@
 #!/usr/bin/env python3
-import sys
-import numpy as np
-
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int16MultiArray, Float32, Int16MultiArray
-
-import pyqtgraph as pg
-from PyQt5 import QtWidgets, QtCore
+from std_msgs.msg import UInt8MultiArray
+import pyaudio
 
 RATE = 16000
+CHANNELS = 6   
+WIDTH = 2
 CHUNK = 1024
-HISTORY = RATE * 2
-FPS = 60
 
 
-class AudioMonitorNode(Node):
+class AudioNode(Node):
     def __init__(self):
-        super().__init__('audio_monitor_gui')
+        super().__init__('respeaker_audio_node')
 
-        self.create_subscription(
-            Int16MultiArray,
-            '/voice/audio_monitor',
-            self.audio_callback,
-            10
-        )
+        # Parameters
+        self.declare_parameter("mode", 1)  
+        self.declare_parameter("device_index", -1)  
+        self.declare_parameter("rate", RATE)
+        self.declare_parameter("channels", CHANNELS)
+        self.declare_parameter("chunk", CHUNK)
+        self.declare_parameter("auto_scan_interval_sec", 2.0)
 
-        self.create_subscription(
-            Float32,
-            '/voice/noise_rms',
-            self.rms_callback,
-            10
-        )
+        self.mode = int(self.get_parameter("mode").value)
+        self.manual_device_index = int(self.get_parameter("device_index").value)
+        self.rate = int(self.get_parameter("rate").value)
+        self.channels = int(self.get_parameter("channels").value)
+        self.chunk = int(self.get_parameter("chunk").value)
+        self.auto_scan_interval_sec = float(self.get_parameter("auto_scan_interval_sec").value)
 
-        self.ring = np.zeros(HISTORY, dtype=np.int16)
-        self.ptr = 0
+        # Publisher
+        self.pub = self.create_publisher(UInt8MultiArray, 'respeaker/audio_raw', 10)
 
-        self.latest = np.zeros(CHUNK, dtype=np.int16)
-        self.rms = 0.0
+        # PyAudio
+        self.p = pyaudio.PyAudio()
+        self.stream = None
+        self.device_index = None
 
-    # -------------------------------------------------
+        # Start logic
+        if self.mode == 1:
+            # mode1 
+            ok = self.try_open_stream()
+            if ok:
+                self.get_logger().info("✅ mode=1: microphone ready")
+            else:
+                self.get_logger().error("❌ mode=1: ReSpeaker device not found at startup")
 
-    def audio_callback(self, msg):
-        data = np.array(msg.data, dtype=np.int16)
+        elif self.mode == 2:
+            # mode2 = auto scan / auto reconnect
+            self.get_logger().info("🔄 mode=2: auto scan enabled")
+            self.try_open_stream()
 
-        if len(data) < 10:
+            # timer สำหรับสแกน/เช็ค reconnect
+            self.scan_timer = self.create_timer(self.auto_scan_interval_sec, self.scan_and_recover)
+
+        else:
+            self.get_logger().warning(f"Unknown mode={self.mode}, fallback to mode=1")
+            self.try_open_stream()
+
+        # publish timer
+        self.publish_timer = self.create_timer(0.05, self.publish_audio)
+
+    # Find device
+    def find_respeaker_device(self):
+        # ถ้าระบุ device index มาเอง
+        if self.manual_device_index >= 0:
+            try:
+                info = self.p.get_device_info_by_index(self.manual_device_index)
+                if int(info.get("maxInputChannels", 0)) > 0:
+                    self.get_logger().info(
+                        f"Using manual device index: {self.manual_device_index} ({info['name']})"
+                    )
+                    return self.manual_device_index
+                else:
+                    self.get_logger().warning(
+                        f"manual device_index={self.manual_device_index} is not input device"
+                    )
+            except Exception as e:
+                self.get_logger().warning(f"Invalid manual device_index={self.manual_device_index}: {e}")
+
+        # auto search
+        best_index = None
+        input_candidates = []
+
+        for i in range(self.p.get_device_count()):
+            try:
+                info = self.p.get_device_info_by_index(i)
+                name = str(info.get("name", ""))
+                max_in = int(info.get("maxInputChannels", 0))
+                if max_in <= 0:
+                    continue
+
+                input_candidates.append((i, name))
+
+                lname = name.lower()
+                if 'respeaker' in lname or 'arrayuac10' in lname:
+                    self.get_logger().info(f"🎤 Found ReSpeaker candidate: index={i}, name={name}")
+                    return i
+
+                # fallback preference
+                if best_index is None:
+                    if lname.strip() in ["pulse", "default"]:
+                        best_index = i
+            except Exception:
+                continue
+
+        if best_index is not None:
+            self.get_logger().warning(f"⚠️ ReSpeaker not found, fallback input device index={best_index}")
+            return best_index
+
+        return None
+
+    # Open / Close stream
+    def try_open_stream(self):
+        if self.stream is not None:
+            return True
+
+        device_index = self.find_respeaker_device()
+        if device_index is None:
+            self.device_index = None
+            return False
+
+        try:
+            self.stream = self.p.open(
+                rate=self.rate,
+                channels=self.channels,
+                format=self.p.get_format_from_width(WIDTH),
+                input=True,
+                input_device_index=device_index,
+                frames_per_buffer=self.chunk
+            )
+            self.device_index = device_index
+            self.get_logger().info(
+                f"✅ Opened mic stream: device_index={device_index}, rate={self.rate}, ch={self.channels}"
+            )
+            return True
+
+        except Exception as e:
+            self.get_logger().error(f"❌ Failed to open mic stream on device {device_index}: {e}")
+            self.stream = None
+            self.device_index = None
+            return False
+
+    def close_stream(self):
+        if self.stream is not None:
+            try:
+                self.stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+
+        self.stream = None
+        self.device_index = None
+
+    # Mode2 auto scan / recover
+    def scan_and_recover(self):
+        if self.mode != 2:
             return
 
-        self.latest = data.copy()
-        n = len(data)
+        # ถ้ายังไม่มี stream -> พยายามหาใหม่
+        if self.stream is None:
+            self.get_logger().info("🔍 Auto-scan: trying to find/open microphone...")
+            self.try_open_stream()
 
-        if n >= HISTORY:
-            self.ring[:] = data[-HISTORY:]
-            self.ptr = 0
+    # Publish audio
+    def publish_audio(self):
+        if self.stream is None:
             return
 
-        end = self.ptr + n
+        try:
+            data = self.stream.read(self.chunk, exception_on_overflow=False)
+            msg = UInt8MultiArray()
+            msg.data = list(data)
+            self.pub.publish(msg)
 
-        if end < HISTORY:
-            self.ring[self.ptr:end] = data
-        else:
-            part = HISTORY - self.ptr
-            self.ring[self.ptr:] = data[:part]
-            self.ring[:n - part] = data[part:]
+        except Exception as e:
+            self.get_logger().warning(f"⚠️ Audio read failed: {e}")
 
-        self.ptr = (self.ptr + n) % HISTORY
+            # ถ้า mode2 -> ปิดแล้วรอ auto reconnect
+            if self.mode == 2:
+                self.get_logger().warning("🔄 Closing stream and waiting for auto reconnect...")
+                self.close_stream()
+            else:
+                # mode1 = ไม่ reconnect
+                self.get_logger().error("❌ mode=1: stream failed, no auto reconnect")
 
-    def rms_callback(self, msg):
-        self.rms = msg.data
+    # Cleanup
+    def destroy_node(self):
+        self.close_stream()
+        try:
+            self.p.terminate()
+        except Exception:
+            pass
+        super().destroy_node()
 
-class AudioWindow(QtWidgets.QMainWindow):
-    def __init__(self, node):
-        super().__init__()
-        self.node = node
 
-        self.setWindowTitle("REALTIME STT Audio Monitor")
-        self.resize(1300, 760)
-
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
-        layout = QtWidgets.QVBoxLayout(central)
-
-        pg.setConfigOptions(antialias=True)
-
-        # ===== WAVE =====
-        self.pw = pg.PlotWidget(title="Realtime Waveform")
-        self.pw.setYRange(-20000, 20000)
-        self.pw.showGrid(x=True, y=True)
-        self.curve_wave = self.pw.plot(pen=pg.mkPen('y', width=1))
-
-        # ===== FFT =====
-        self.pf = pg.PlotWidget(title="FFT Spectrum")
-        self.pf.setXRange(0, 8000)
-        self.pf.setYRange(0, 110)
-        self.pf.showGrid(x=True, y=True)
-        self.curve_fft = self.pf.plot(pen=pg.mkPen('c', width=1))
-
-        # ===== INFO =====
-        self.label = QtWidgets.QLabel("RMS: 0")
-        self.label.setStyleSheet("font-size:16px; color: lime")
-
-        self.indicator = QtWidgets.QLabel("● AUDIO")
-        self.indicator.setStyleSheet("font-size:18px; color: gray")
-
-        layout.addWidget(self.pw)
-        layout.addWidget(self.pf)
-        layout.addWidget(self.label)
-        layout.addWidget(self.indicator)
-
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_plot)
-        self.timer.start(int(1000 / FPS))
-
-    # -------------------------------------------------
-
-    def update_plot(self):
-        ptr = self.node.ptr
-        ring = self.node.ring
-
-        view = np.roll(ring, -ptr)
-        self.curve_wave.setData(view)
-
-        # FFT
-        s = view[::4]
-        fft = np.abs(np.fft.rfft(s))
-        fft[fft == 0] = 1e-12
-
-        fft_db = 20 * np.log10(fft)
-        freq = np.fft.rfftfreq(len(s), 1.0 / RATE)
-
-        self.curve_fft.setData(freq, fft_db)
-
-        self.label.setText(f"RMS: {int(self.node.rms)}")
-
-        # indicator
-        if self.node.rms > 80:
-            self.indicator.setStyleSheet("font-size:18px; color: lime")
-        else:
-            self.indicator.setStyleSheet("font-size:18px; color: gray")
-
-def main():
-    rclpy.init()
-
-    node = AudioMonitorNode()
-
-    app = QtWidgets.QApplication(sys.argv)
-    win = AudioWindow(node)
-    win.show()
-
-    ros_timer = QtCore.QTimer()
-    ros_timer.timeout.connect(
-        lambda: rclpy.spin_once(node, timeout_sec=0)
-    )
-    ros_timer.start(5)
-
-    sys.exit(app.exec_())
+def main(args=None):
+    rclpy.init(args=args)
+    node = AudioNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
